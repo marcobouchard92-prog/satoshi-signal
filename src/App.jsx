@@ -14,7 +14,6 @@ const TIMEFRAMES = [
   { id:'1Y', label:'1Y', interval:'3d',  limit:122, desc:'Long-term' },
 ]
 
-// ── Indicators ──────────────────────────────────────────────────────────────
 function calcRSI(prices, period=14) {
   if (prices.length < period+1) return 50
   let ag=0, al=0
@@ -72,20 +71,12 @@ function genSignal(ind, price, sens='balanced') {
 const fmt=(n,d=0)=>Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})
 const fmtK=n=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n))
 
-// ── Notification helper ──────────────────────────────────────────────────────
-function sendNotification(signal, price, conf, tf) {
-  if (Notification.permission !== 'granted') return
-  const emoji = signal==='BUY' ? '🟢' : signal==='SELL' ? '🔴' : '🟡'
-  const body = `${emoji} ${signal} signal @ $${fmt(price)} — Confidence ${conf}% (${tf})`
-  try {
-    new Notification('₿ Satoshi Signal', {
-      body,
-      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">₿</text></svg>',
-      badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">₿</text></svg>',
-      tag: 'satoshi-signal',
-      renotify: true,
-    })
-  } catch(e) { console.log('Notification error:', e) }
+// ── Send notification via Service Worker ─────────────────────────────────────
+function notifySignal(signal, price, conf, tf) {
+  if (!navigator.serviceWorker?.controller) return
+  navigator.serviceWorker.controller.postMessage({
+    type: 'SIGNAL_CHANGE', signal, price, conf, tf
+  })
 }
 
 // ── Components ───────────────────────────────────────────────────────────────
@@ -147,36 +138,6 @@ function MACDBars({histogram,width=180,height=50}) {
   )
 }
 
-// ── Notification Banner ──────────────────────────────────────────────────────
-function NotifBanner({notifStatus, onRequest}) {
-  if (notifStatus === 'granted') return (
-    <div style={{background:`${C.green}11`,border:`1px solid ${C.green}33`,borderRadius:8,padding:'10px 14px',display:'flex',alignItems:'center',gap:10,fontSize:11}}>
-      <span style={{fontSize:16}}>🔔</span>
-      <span style={{color:C.green}}>Notifications actives — tu recevras une alerte à chaque changement de signal</span>
-    </div>
-  )
-  if (notifStatus === 'denied') return (
-    <div style={{background:`${C.red}11`,border:`1px solid ${C.red}33`,borderRadius:8,padding:'10px 14px',fontSize:11,color:C.red}}>
-      🔕 Notifications bloquées — autorise-les dans les paramètres de ton navigateur
-    </div>
-  )
-  if (notifStatus === 'unsupported') return (
-    <div style={{background:`${C.yellow}11`,border:`1px solid ${C.yellow}33`,borderRadius:8,padding:'10px 14px',fontSize:11,color:C.yellow}}>
-      ⚠️ Notifications non supportées sur ce navigateur
-    </div>
-  )
-  return (
-    <button onClick={onRequest} style={{width:'100%',background:`${C.accent}11`,border:`1px solid ${C.accent}44`,borderRadius:8,padding:'12px 14px',display:'flex',alignItems:'center',gap:10,fontSize:11,cursor:'pointer',fontFamily:'monospace',color:C.accent,textAlign:'left'}}>
-      <span style={{fontSize:18}}>🔔</span>
-      <div>
-        <div style={{fontWeight:700,marginBottom:2}}>Activer les notifications push</div>
-        <div style={{color:C.muted,fontSize:10}}>Reçois une alerte sur ton téléphone à chaque signal BUY / SELL</div>
-      </div>
-    </button>
-  )
-}
-
-// ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [tf, setTf] = useState(TIMEFRAMES[1])
   const [sens, setSens] = useState('balanced')
@@ -184,20 +145,29 @@ export default function App() {
   const [tab, setTab] = useState('dashboard')
   const [prices, setPrices] = useState([])
   const [ticker, setTicker] = useState(null)
-  const [status, setStatus] = useState('Connecting to Binance...')
+  const [status, setStatus] = useState('Connecting...')
   const [sigHistory, setSigHistory] = useState([])
+  const [alertLog, setAlertLog] = useState([])
   const [aiText, setAiText] = useState('')
   const [aiLoad, setAiLoad] = useState(false)
   const [notifStatus, setNotifStatus] = useState('default')
-  const [alertLog, setAlertLog] = useState([])
+  const [swReady, setSwReady] = useState(false)
   const lastSig = useRef(null)
 
-  // Check notification permission on load
+  // Register Service Worker
   useEffect(() => {
-    if (!('Notification' in window)) {
-      setNotifStatus('unsupported')
-    } else {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js')
+        .then(reg => {
+          setSwReady(true)
+          console.log('SW registered:', reg.scope)
+        })
+        .catch(err => console.log('SW error:', err))
+    }
+    if ('Notification' in window) {
       setNotifStatus(Notification.permission)
+    } else {
+      setNotifStatus('unsupported')
     }
   }, [])
 
@@ -205,10 +175,13 @@ export default function App() {
     if (!('Notification' in window)) { setNotifStatus('unsupported'); return }
     const perm = await Notification.requestPermission()
     setNotifStatus(perm)
-    if (perm === 'granted') {
-      new Notification('₿ Satoshi Signal', {
-        body: '🔔 Notifications activées ! Tu recevras des alertes BUY / SELL en temps réel.',
-        tag: 'satoshi-welcome',
+    if (perm === 'granted' && navigator.serviceWorker?.controller) {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'SIGNAL_CHANGE',
+        signal: 'BUY',
+        price: 84000,
+        conf: 72,
+        tf: 'TEST'
       })
     }
   }, [])
@@ -232,9 +205,7 @@ export default function App() {
         changePct:parseFloat(tData.priceChangePercent),
       })
       setStatus('LIVE · ' + new Date().toLocaleTimeString())
-    } catch(e) {
-      setStatus('Error — retrying...')
-    }
+    } catch { setStatus('Retrying...') }
   }, [tf])
 
   useEffect(() => { fetchData() }, [tf])
@@ -248,41 +219,35 @@ export default function App() {
   const chgColor = chgPct>=0 ? C.green : C.red
 
   const ind = prices.length > 30 ? {
-    rsi: calcRSI(prices, rsiP),
-    macd: calcMACD(prices),
-    bb: calcBB(prices),
+    rsi: calcRSI(prices, rsiP), macd: calcMACD(prices), bb: calcBB(prices),
     e9:calcEMA(prices,9), e21:calcEMA(prices,21),
     e50:calcEMA(prices,50), e200:calcEMA(prices,Math.min(200,prices.length-1)),
   } : null
 
   const sig = ind ? genSignal(ind, cur, sens) : {signal:'HOLD',conf:50,buy:0,sell:0,reasons:[]}
 
-  // Signal change detection + notification
   useEffect(() => {
     if (!ind || !cur) return
-    const {signal,conf}=sig
+    const {signal, conf} = sig
     if (signal !== lastSig.current) {
       const prev = lastSig.current
       lastSig.current = signal
-
-      // Record history for non-HOLD signals
       if (signal !== 'HOLD') {
-        const entry = {signal,conf,price:cur,time:new Date().toLocaleTimeString(),tf:tf.label}
-        setSigHistory(h=>[entry,...h].slice(0,30))
-
-        // Send notification
-        sendNotification(signal, cur, conf, tf.label)
-
-        // Add to alert log
-        if (prev !== null) {
-          const msg = prev
-            ? `Signal changed: ${prev} → ${signal}`
-            : `New signal: ${signal}`
-          setAlertLog(l=>[{msg, signal, price:cur, time:new Date().toLocaleTimeString()},...l].slice(0,10))
+        setSigHistory(h=>[{signal,conf,price:cur,time:new Date().toLocaleTimeString(),tf:tf.label},...h].slice(0,30))
+        // Send via Service Worker (works in background)
+        if (notifStatus === 'granted') {
+          notifySignal(signal, cur, conf, tf.label)
         }
       }
+      if (prev !== null) {
+        setAlertLog(l=>[{
+          msg: prev ? `${prev} → ${signal}` : `Nouveau signal: ${signal}`,
+          signal, price: cur,
+          time: new Date().toLocaleTimeString()
+        },...l].slice(0,20))
+      }
     }
-  }, [sig.signal, cur])
+  }, [sig.signal, cur, notifStatus])
 
   const runAI = useCallback(async () => {
     if (!ind) return
@@ -292,14 +257,12 @@ export default function App() {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           model:'claude-sonnet-4-20250514', max_tokens:1000,
-          messages:[{role:'user',content:`Expert Bitcoin analyst. Real Binance data, ${tf.label} timeframe (${tf.desc}). 4-5 sentences, direct.
-
-BTC/USDT: $${fmt(cur)} | 24h: ${chgPct.toFixed(2)}% | H: $${fmt(ticker?.high||0)} | L: $${fmt(ticker?.low||0)} | Vol: $${fmtK(ticker?.volume||0)}
-RSI(${rsiP}): ${ind.rsi.toFixed(1)} | MACD: ${ind.macd.macd.toFixed(0)}/${ind.macd.signal.toFixed(0)}
-EMA 9/21/50/200: $${fmt(ind.e9)}/$${fmt(ind.e21)}/$${fmt(ind.e50)}/$${fmt(ind.e200)}
-BB: U$${fmt(ind.bb.upper)} M$${fmt(ind.bb.middle)} L$${fmt(ind.bb.lower)} BW:${ind.bb.bw.toFixed(1)}%
-Signal: ${sig.signal} @ ${sig.conf}% | Mode: ${sens}
-
+          messages:[{role:'user',content:`Expert Bitcoin analyst. Real Binance data, ${tf.label} (${tf.desc}). 4-5 sentences.
+BTC: $${fmt(cur)} | 24h: ${chgPct.toFixed(2)}% | H:$${fmt(ticker?.high||0)} L:$${fmt(ticker?.low||0)} Vol:$${fmtK(ticker?.volume||0)}
+RSI(${rsiP}):${ind.rsi.toFixed(1)} | MACD:${ind.macd.macd.toFixed(0)}/${ind.macd.signal.toFixed(0)}
+EMA9/21/50/200:$${fmt(ind.e9)}/$${fmt(ind.e21)}/$${fmt(ind.e50)}/$${fmt(ind.e200)}
+BB:U$${fmt(ind.bb.upper)} M$${fmt(ind.bb.middle)} L$${fmt(ind.bb.lower)} BW:${ind.bb.bw.toFixed(1)}%
+Signal:${sig.signal}@${sig.conf}% Mode:${sens}
 Analysis:`}],
         }),
       })
@@ -317,7 +280,6 @@ Analysis:`}],
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.8}}
     @keyframes blink{0%,100%{opacity:1}50%{opacity:.1}}
     @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-    @keyframes slideDown{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
     .tab{background:none;border:none;cursor:pointer;padding:10px 16px;border-bottom:2px solid transparent;font-family:inherit;font-size:11px;letter-spacing:2px;text-transform:uppercase;transition:all .2s;color:#3a5a6a}
     .tab:hover{color:#00c8ff}.tab.on{color:#00c8ff;border-bottom-color:#00c8ff}
     .tf{background:none;border:1px solid #0e2030;border-radius:6px;padding:5px 10px;font-family:inherit;font-size:10px;cursor:pointer;transition:all .2s;color:#3a5a6a;text-align:center}
@@ -329,6 +291,8 @@ Analysis:`}],
     .ir:last-child{border:none}
     .cbtn{width:32px;height:32px;background:#0e2030;border:none;border-radius:6px;color:#b0ccd8;font-size:18px;cursor:pointer}
   `
+
+  const notifColor = notifStatus==='granted' ? C.green : notifStatus==='denied' ? C.red : C.yellow
 
   return (
     <div style={{minHeight:'100vh',background:C.bg}}>
@@ -345,10 +309,10 @@ Analysis:`}],
                 <div style={{fontSize:8,color:C.muted,letterSpacing:2}}>BINANCE REAL-TIME · BTC/USDT</div>
               </div>
             </div>
-            <div style={{display:'flex',alignItems:'center',gap:18}}>
-              {/* Notif bell */}
-              <button onClick={requestNotif} title="Notifications" style={{background:'none',border:'none',cursor:'pointer',fontSize:18,opacity:notifStatus==='granted'?1:0.4}}>
-                {notifStatus==='granted'?'🔔':'🔕'}
+            <div style={{display:'flex',alignItems:'center',gap:14}}>
+              <button onClick={requestNotif} style={{background:'none',border:`1px solid ${notifColor}44`,borderRadius:8,padding:'6px 10px',cursor:'pointer',fontSize:11,color:notifColor,fontFamily:'monospace',display:'flex',alignItems:'center',gap:6}}>
+                <span>{notifStatus==='granted'?'🔔':'🔕'}</span>
+                <span style={{fontSize:9}}>{notifStatus==='granted'?'ON':'Activer'}</span>
               </button>
               <div style={{textAlign:'right'}}>
                 <div style={{fontSize:22,fontWeight:900,color:C.white,fontFamily:"'Orbitron',monospace"}}>
@@ -358,7 +322,7 @@ Analysis:`}],
               </div>
               <div style={{textAlign:'center'}}>
                 <div style={{width:8,height:8,borderRadius:'50%',background:status.includes('LIVE')?C.green:C.yellow,boxShadow:`0 0 8px ${status.includes('LIVE')?C.green:C.yellow}`,margin:'0 auto 3px',animation:'blink 2s ease-in-out infinite'}}/>
-                <div style={{fontSize:7,color:C.muted}}>{status.includes('LIVE')?'LIVE':'LOADING'}</div>
+                <div style={{fontSize:7,color:C.muted}}>{status.includes('LIVE')?'LIVE':'...'}</div>
               </div>
             </div>
           </div>
@@ -381,7 +345,6 @@ Analysis:`}],
 
       <div style={{maxWidth:1100,margin:'0 auto',padding:'18px 18px 80px'}}>
 
-        {/* ── DASHBOARD ── */}
         {tab==='dashboard' && (
           <div style={{display:'grid',gridTemplateColumns:'300px 1fr',gap:14,animation:'fadeIn .3s ease'}}>
             <div className="card" style={{borderColor:`${C.accent}22`,background:'linear-gradient(135deg,#0a1520,#0d1f30)',display:'flex',flexDirection:'column',gap:14}}>
@@ -390,7 +353,7 @@ Analysis:`}],
               <div style={{display:'flex',gap:8}}>
                 {[['BUY',sig.buy,C.green],['SELL',sig.sell,C.red]].map(([l,v,c])=>(
                   <div key={l} style={{flex:1,background:`${c}11`,border:`1px solid ${c}33`,borderRadius:8,padding:10,textAlign:'center'}}>
-                    <div style={{fontSize:9,color:C.muted,marginBottom:3,letterSpacing:1}}>{l}</div>
+                    <div style={{fontSize:9,color:C.muted,marginBottom:3}}>{l}</div>
                     <div style={{fontSize:20,color:c,fontWeight:800}}>{v}</div>
                   </div>
                 ))}
@@ -400,7 +363,7 @@ Analysis:`}],
                   <span style={{color:C.muted}}>Strength</span><span style={{color:C.accent}}>{sig.conf}%</span>
                 </div>
                 <div style={{height:5,background:C.border,borderRadius:3,overflow:'hidden'}}>
-                  <div style={{height:'100%',width:`${sig.conf}%`,background:sig.signal==='BUY'?C.green:sig.signal==='SELL'?C.red:C.yellow,borderRadius:3,transition:'width .6s ease'}}/>
+                  <div style={{height:'100%',width:`${sig.conf}%`,background:sig.signal==='BUY'?C.green:sig.signal==='SELL'?C.red:C.yellow,borderRadius:3,transition:'width .6s'}}/>
                 </div>
               </div>
               <div style={{display:'flex',flexDirection:'column',gap:5}}>
@@ -410,7 +373,15 @@ Analysis:`}],
                   </div>
                 ))}
               </div>
-              <NotifBanner notifStatus={notifStatus} onRequest={requestNotif}/>
+              {/* Notif status in card */}
+              <div style={{background:`${notifColor}0a`,border:`1px solid ${notifColor}33`,borderRadius:8,padding:'10px 12px',fontSize:10}}>
+                <span style={{color:notifColor}}>
+                  {notifStatus==='granted' ? '🔔 Notifications actives — alertes BUY/SELL activées' :
+                   notifStatus==='denied'  ? '🔕 Notifications bloquées — vérifie les paramètres Chrome' :
+                   notifStatus==='unsupported' ? '⚠️ Non supporté sur ce navigateur' :
+                   '🔔 Clique sur "Activer" en haut pour les notifications'}
+                </span>
+              </div>
               <div style={{fontSize:9,color:C.muted,textAlign:'center'}}>{status}</div>
             </div>
 
@@ -423,16 +394,15 @@ Analysis:`}],
                     {ticker&&<div style={{fontSize:12,color:chgColor,marginTop:2}}>{chgPct>=0?'▲':'▼'} ${fmt(Math.abs(ticker.change))} ({Math.abs(chgPct).toFixed(2)}%)</div>}
                   </div>
                   <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'5px 14px',textAlign:'right'}}>
-                    {[['HIGH',ticker?.high,C.green],['LOW',ticker?.low,C.red],['VOLUME',ticker?.volume,C.text],['OPEN',ticker?.open,C.accent]].map(([l,v,c])=>(
+                    {[['HIGH',ticker?.high,C.green],['LOW',ticker?.low,C.red],['VOL',ticker?.volume,C.text],['OPEN',ticker?.open,C.accent]].map(([l,v,c])=>(
                       <div key={l}><div style={{fontSize:8,color:C.muted}}>{l}</div>
-                        <div style={{fontSize:11,color:c,fontWeight:700}}>{v?(l==='VOLUME'?'$'+fmtK(v):'$'+fmt(v)):'—'}</div>
+                        <div style={{fontSize:11,color:c,fontWeight:700}}>{v?(l==='VOL'?'$'+fmtK(v):'$'+fmt(v)):'—'}</div>
                       </div>
                     ))}
                   </div>
                 </div>
-                {prices.length>2
-                  ? <Sparkline prices={prices} width={680} height={100} color={chgColor}/>
-                  : <div style={{height:100,display:'flex',alignItems:'center',justifyContent:'center',color:C.muted,fontSize:12}}>⏳ Loading chart...</div>}
+                {prices.length>2 ? <Sparkline prices={prices} width={680} height={100} color={chgColor}/>
+                  : <div style={{height:100,display:'flex',alignItems:'center',justifyContent:'center',color:C.muted,fontSize:12}}>⏳ Loading...</div>}
                 {ind&&(
                   <div style={{display:'flex',gap:14,marginTop:10,flexWrap:'wrap'}}>
                     {[['EMA9',ind.e9,'#ff6b35'],['EMA21',ind.e21,'#bf5af2'],['EMA50',ind.e50,C.accent],['EMA200',ind.e200,C.yellow]].map(([l,v,c])=>(
@@ -444,38 +414,32 @@ Analysis:`}],
                   </div>
                 )}
               </div>
-
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
                 <div className="card">
-                  <div style={{fontSize:9,color:C.muted,letterSpacing:2,marginBottom:10}}>RSI ({rsiP}) — {tf.label}</div>
-                  {ind?(
-                    <>
-                      <div style={{display:'flex',justifyContent:'center'}}><RSIArc value={ind.rsi}/></div>
-                      <div style={{height:4,background:`linear-gradient(90deg,${C.green},${C.yellow},${C.red})`,borderRadius:2,marginTop:8,position:'relative'}}>
-                        <div style={{position:'absolute',left:`${Math.max(2,Math.min(97,ind.rsi))}%`,top:-4,transform:'translateX(-50%)',width:12,height:12,borderRadius:'50%',background:C.white,border:`2px solid ${C.accent}`,transition:'left .5s'}}/>
-                      </div>
-                      <div style={{textAlign:'center',marginTop:8,fontSize:10,color:ind.rsi<30?C.green:ind.rsi>70?C.red:C.yellow}}>
-                        {ind.rsi<30?'OVERSOLD':ind.rsi>70?'OVERBOUGHT':'NEUTRAL'}
-                      </div>
-                    </>
-                  ):<div style={{color:C.muted,fontSize:11,textAlign:'center',padding:'20px 0'}}>⏳ Loading...</div>}
+                  <div style={{fontSize:9,color:C.muted,letterSpacing:2,marginBottom:10}}>RSI ({rsiP})</div>
+                  {ind?(<>
+                    <div style={{display:'flex',justifyContent:'center'}}><RSIArc value={ind.rsi}/></div>
+                    <div style={{height:4,background:`linear-gradient(90deg,${C.green},${C.yellow},${C.red})`,borderRadius:2,marginTop:8,position:'relative'}}>
+                      <div style={{position:'absolute',left:`${Math.max(2,Math.min(97,ind.rsi))}%`,top:-4,transform:'translateX(-50%)',width:12,height:12,borderRadius:'50%',background:C.white,border:`2px solid ${C.accent}`,transition:'left .5s'}}/>
+                    </div>
+                    <div style={{textAlign:'center',marginTop:8,fontSize:10,color:ind.rsi<30?C.green:ind.rsi>70?C.red:C.yellow}}>
+                      {ind.rsi<30?'OVERSOLD':ind.rsi>70?'OVERBOUGHT':'NEUTRAL'}
+                    </div>
+                  </>):<div style={{color:C.muted,fontSize:11,textAlign:'center',padding:'20px 0'}}>⏳</div>}
                 </div>
                 <div className="card">
-                  <div style={{fontSize:9,color:C.muted,letterSpacing:2,marginBottom:10}}>MACD — {tf.label}</div>
-                  {ind?(
-                    <>
-                      <MACDBars histogram={ind.macd.histogram} width={200} height={55}/>
-                      {[['MACD',ind.macd.macd,C.accent],['Signal',ind.macd.signal,C.yellow],['Histo',ind.macd.histogram,ind.macd.histogram>=0?C.green:C.red]].map(([l,v,c])=>(
-                        <div key={l} className="ir"><span style={{fontSize:10,color:C.muted}}>{l}</span><span style={{fontSize:11,color:c,fontWeight:700}}>{v.toFixed(0)}</span></div>
-                      ))}
-                    </>
-                  ):<div style={{color:C.muted,fontSize:11,textAlign:'center',padding:'20px 0'}}>⏳ Loading...</div>}
+                  <div style={{fontSize:9,color:C.muted,letterSpacing:2,marginBottom:10}}>MACD</div>
+                  {ind?(<>
+                    <MACDBars histogram={ind.macd.histogram} width={200} height={55}/>
+                    {[['MACD',ind.macd.macd,C.accent],['Signal',ind.macd.signal,C.yellow],['Histo',ind.macd.histogram,ind.macd.histogram>=0?C.green:C.red]].map(([l,v,c])=>(
+                      <div key={l} className="ir"><span style={{fontSize:10,color:C.muted}}>{l}</span><span style={{fontSize:11,color:c,fontWeight:700}}>{v.toFixed(0)}</span></div>
+                    ))}
+                  </>):<div style={{color:C.muted,fontSize:11,textAlign:'center',padding:'20px 0'}}>⏳</div>}
                 </div>
               </div>
-
               {ind&&(
                 <div className="card">
-                  <div style={{fontSize:9,color:C.muted,letterSpacing:2,marginBottom:12}}>BOLLINGER BANDS — {tf.label}</div>
+                  <div style={{fontSize:9,color:C.muted,letterSpacing:2,marginBottom:12}}>BOLLINGER BANDS</div>
                   <div style={{display:'flex',justifyContent:'space-between',marginBottom:12}}>
                     {[['Upper',ind.bb.upper,C.red],['Price',cur,C.accent],['Middle',ind.bb.middle,C.muted],['Lower',ind.bb.lower,C.green]].map(([l,v,c])=>(
                       <div key={l} style={{textAlign:'center'}}>
@@ -487,7 +451,7 @@ Analysis:`}],
                   <div style={{height:6,background:C.border,borderRadius:3,position:'relative'}}>
                     <div style={{position:'absolute',left:`${Math.max(1,Math.min(98,(cur-ind.bb.lower)/(ind.bb.upper-ind.bb.lower)*100))}%`,top:-3,transform:'translateX(-50%)',width:12,height:12,borderRadius:'50%',background:C.accent,border:`2px solid ${C.bg}`,transition:'left .5s'}}/>
                   </div>
-                  <div style={{fontSize:10,color:C.muted,marginTop:8}}>Bandwidth: <span style={{color:C.accent}}>{ind.bb.bw.toFixed(1)}%</span></div>
+                  <div style={{fontSize:10,color:C.muted,marginTop:8}}>BW: <span style={{color:C.accent}}>{ind.bb.bw.toFixed(1)}%</span></div>
                 </div>
               )}
             </div>
@@ -496,20 +460,19 @@ Analysis:`}],
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
                 <div>
                   <div style={{fontSize:10,color:C.accent,letterSpacing:3,fontWeight:700}}>⬡ AI ANALYSIS — CLAUDE</div>
-                  <div style={{fontSize:10,color:C.muted,marginTop:2}}>Binance real data · <span style={{color:C.accent}}>{tf.label} — {tf.desc}</span></div>
+                  <div style={{fontSize:10,color:C.muted,marginTop:2}}>{tf.label} — {tf.desc}</div>
                 </div>
-                <button onClick={runAI} disabled={aiLoad||!ind} style={{background:`${C.accent}18`,border:`1px solid ${C.accent}`,color:C.accent,padding:'10px 18px',borderRadius:8,fontFamily:'inherit',fontSize:11,cursor:'pointer',letterSpacing:1,opacity:(!ind||aiLoad)?.5:1}}>
+                <button onClick={runAI} disabled={aiLoad||!ind} style={{background:`${C.accent}18`,border:`1px solid ${C.accent}`,color:C.accent,padding:'10px 18px',borderRadius:8,fontFamily:'inherit',fontSize:11,cursor:'pointer',opacity:(!ind||aiLoad)?.5:1}}>
                   {aiLoad?'Analyzing...':'Run AI Analysis'}
                 </button>
               </div>
               {aiText
                 ?<div style={{background:C.surface,borderRadius:8,padding:16,fontSize:13,lineHeight:1.8,color:C.text,whiteSpace:'pre-wrap',borderLeft:`3px solid ${C.accent}`}}>{aiText}</div>
-                :<div style={{color:C.muted,fontSize:12,textAlign:'center',padding:'14px 0'}}>Click "Run AI Analysis" for Claude's {tf.label} BTC read.</div>}
+                :<div style={{color:C.muted,fontSize:12,textAlign:'center',padding:'14px 0'}}>Click "Run AI Analysis" for Claude's read.</div>}
             </div>
           </div>
         )}
 
-        {/* ── SIGNALS ── */}
         {tab==='signals' && (
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,animation:'fadeIn .3s ease'}}>
             <div className="card" style={{gridColumn:'1 / 3'}}>
@@ -525,20 +488,20 @@ Analysis:`}],
               </div>
             </div>
             <div className="card">
-              <div style={{fontSize:9,color:C.muted,letterSpacing:3,marginBottom:14}}>SIGNAL LOGIC — {tf.label}</div>
+              <div style={{fontSize:9,color:C.muted,letterSpacing:3,marginBottom:14}}>SIGNAL — {tf.label}</div>
               <div style={{display:'flex',justifyContent:'center',marginBottom:14}}><Badge signal={sig.signal} conf={sig.conf}/></div>
               {sig.reasons.map((r,i)=>(
-                <div key={i} style={{display:'flex',gap:10,alignItems:'flex-start',padding:'8px 0',borderBottom:`1px solid ${C.border}44`}}>
+                <div key={i} style={{display:'flex',gap:10,padding:'8px 0',borderBottom:`1px solid ${C.border}44`}}>
                   <div style={{width:6,height:6,borderRadius:'50%',background:r.s==='buy'?C.green:C.red,marginTop:4,flexShrink:0}}/>
-                  <div><div style={{fontSize:9,color:r.s==='buy'?C.green:C.red,fontWeight:700,letterSpacing:1}}>{r.s.toUpperCase()}</div><div style={{fontSize:11,color:C.text}}>{r.t}</div></div>
+                  <div><div style={{fontSize:9,color:r.s==='buy'?C.green:C.red,fontWeight:700}}>{r.s.toUpperCase()}</div><div style={{fontSize:11,color:C.text}}>{r.t}</div></div>
                 </div>
               ))}
             </div>
             <div className="card">
               <div style={{fontSize:9,color:C.muted,letterSpacing:3,marginBottom:14}}>SIGNAL HISTORY</div>
-              {!sigHistory.length?<div style={{color:C.muted,fontSize:12}}>Waiting for signals...</div>
+              {!sigHistory.length?<div style={{color:C.muted,fontSize:12}}>Waiting...</div>
                 :sigHistory.map((s,i)=>(
-                  <div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderBottom:`1px solid ${C.border}33`,fontSize:11}}>
+                  <div key={i} style={{display:'flex',justifyContent:'space-between',padding:'8px 0',borderBottom:`1px solid ${C.border}33`,fontSize:11}}>
                     <div style={{display:'flex',gap:8,alignItems:'center'}}>
                       <span style={{color:s.signal==='BUY'?C.green:C.red,fontWeight:800}}>{s.signal}</span>
                       <span style={{color:C.muted,fontSize:9}}>{s.time}</span>
@@ -554,34 +517,46 @@ Analysis:`}],
           </div>
         )}
 
-        {/* ── ALERTS ── */}
         {tab==='alerts' && (
           <div style={{display:'flex',flexDirection:'column',gap:14,animation:'fadeIn .3s ease'}}>
-            <div className="card" style={{borderColor:`${C.accent}22`}}>
-              <div style={{fontSize:10,color:C.accent,letterSpacing:3,fontWeight:700,marginBottom:14}}>🔔 NOTIFICATIONS PUSH</div>
-              <NotifBanner notifStatus={notifStatus} onRequest={requestNotif}/>
-              <div style={{marginTop:16,fontSize:11,color:C.muted,lineHeight:1.8}}>
-                <p style={{marginBottom:8}}>Les notifications push t'alertent <strong style={{color:C.text}}>même si l'app est fermée</strong> (tant que l'onglet est ouvert en arrière-plan).</p>
-                <p>Tu recevras une alerte à chaque fois que le signal change :</p>
-                <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:6}}>
-                  {[['🟢 BUY','Signal d\'achat détecté',C.green],['🔴 SELL','Signal de vente détecté',C.red],['🟡 HOLD','Retour en zone neutre',C.yellow]].map(([s,d,c])=>(
-                    <div key={s} style={{display:'flex',gap:10,alignItems:'center',padding:'8px 12px',background:`${c}0a`,borderRadius:8,border:`1px solid ${c}22`}}>
-                      <span style={{fontSize:16}}>{s.split(' ')[0]}</span>
-                      <div><div style={{color:c,fontWeight:700,fontSize:11}}>{s.split(' ')[1]}</div><div style={{color:C.muted,fontSize:10}}>{d}</div></div>
-                    </div>
-                  ))}
+            <div className="card" style={{borderColor:`${notifColor}33`}}>
+              <div style={{fontSize:10,color:C.accent,letterSpacing:3,fontWeight:700,marginBottom:16}}>🔔 NOTIFICATIONS PUSH</div>
+              <div style={{display:'flex',flexDirection:'column',gap:12}}>
+                <div style={{background:`${notifColor}0a`,border:`1px solid ${notifColor}33`,borderRadius:10,padding:16}}>
+                  <div style={{fontSize:13,color:notifColor,fontWeight:700,marginBottom:6}}>
+                    {notifStatus==='granted' ? '✅ Notifications activées' :
+                     notifStatus==='denied'  ? '❌ Notifications bloquées' :
+                     notifStatus==='unsupported' ? '⚠️ Non supporté' : '⏸ Notifications désactivées'}
+                  </div>
+                  <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.7}}>
+                    {notifStatus==='granted'
+                      ? `Le Service Worker est ${swReady?'actif ✓':'en cours d\'installation...'} — tu recevras une notification push à chaque changement de signal BUY/SELL, même si Chrome est en arrière-plan.`
+                      : notifStatus==='denied'
+                      ? 'Chrome bloque les notifications. Va dans Paramètres Chrome → Confidentialité → Notifications → cherche ton URL Vercel → Autorise.'
+                      : 'Appuie sur le bouton ci-dessous pour activer les alertes push en temps réel.'}
+                  </div>
+                  {notifStatus !== 'granted' && notifStatus !== 'unsupported' && (
+                    <button onClick={requestNotif} style={{background:`${C.accent}22`,border:`1px solid ${C.accent}`,color:C.accent,padding:'12px 20px',borderRadius:8,fontFamily:'monospace',fontSize:12,cursor:'pointer',width:'100%'}}>
+                      🔔 Activer les notifications push
+                    </button>
+                  )}
+                  {notifStatus==='granted' && (
+                    <button onClick={()=>notifySignal('BUY', cur||84000, 75, tf.label)} style={{background:`${C.green}11`,border:`1px solid ${C.green}33`,color:C.green,padding:'10px 20px',borderRadius:8,fontFamily:'monospace',fontSize:11,cursor:'pointer',width:'100%'}}>
+                      🧪 Tester une notification
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
 
             <div className="card">
-              <div style={{fontSize:9,color:C.muted,letterSpacing:3,marginBottom:14}}>JOURNAL DES ALERTES</div>
+              <div style={{fontSize:9,color:C.muted,letterSpacing:3,marginBottom:14}}>JOURNAL DES ALERTES ({alertLog.length})</div>
               {!alertLog.length
-                ? <div style={{color:C.muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Aucune alerte pour l'instant — les changements de signal apparaîtront ici</div>
+                ? <div style={{color:C.muted,fontSize:12,textAlign:'center',padding:'24px 0'}}>Aucune alerte — les changements de signal apparaîtront ici</div>
                 : alertLog.map((a,i)=>(
-                  <div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 0',borderBottom:`1px solid ${C.border}33`,animation:'slideDown .3s ease'}}>
+                  <div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 0',borderBottom:`1px solid ${C.border}33`}}>
                     <div style={{display:'flex',gap:10,alignItems:'center'}}>
-                      <span style={{fontSize:16}}>{a.signal==='BUY'?'🟢':a.signal==='SELL'?'🔴':'🟡'}</span>
+                      <span style={{fontSize:18}}>{a.signal==='BUY'?'🟢':a.signal==='SELL'?'🔴':'🟡'}</span>
                       <div>
                         <div style={{fontSize:11,color:a.signal==='BUY'?C.green:a.signal==='SELL'?C.red:C.yellow,fontWeight:700}}>{a.msg}</div>
                         <div style={{fontSize:10,color:C.muted}}>{a.time}</div>
@@ -594,7 +569,6 @@ Analysis:`}],
           </div>
         )}
 
-        {/* ── SETTINGS ── */}
         {tab==='settings' && (
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,animation:'fadeIn .3s ease'}}>
             <div className="card">
@@ -618,7 +592,7 @@ Analysis:`}],
               </div>
               <div style={{background:`${C.accent}08`,border:`1px solid ${C.accent}22`,borderRadius:8,padding:14,fontSize:11,color:C.muted,lineHeight:1.7}}>
                 ⚠️ <strong style={{color:C.accent}}>Advisory Only</strong><br/>
-                Real Binance BTC/USDT data. Signals are informational only. Not financial advice.
+                Real Binance data. Not financial advice.
               </div>
             </div>
           </div>
@@ -628,7 +602,7 @@ Analysis:`}],
       <div style={{position:'fixed',bottom:0,left:0,right:0,borderTop:`1px solid ${C.border}`,background:`${C.surface}f0`,backdropFilter:'blur(10px)',padding:'7px 18px',display:'flex',justifyContent:'space-between',fontSize:9,color:C.muted}}>
         <span>SATOSHI — Binance BTC/USDT — Advisory only</span>
         <div style={{display:'flex',gap:14}}>
-          <span>{notifStatus==='granted'?'🔔':'🔕'}</span>
+          <span>{notifStatus==='granted'?'🔔 ON':'🔕'}</span>
           <span>TF: <span style={{color:C.accent}}>{tf.label}</span></span>
           <span>SIGNAL: <span style={{color:sig.signal==='BUY'?C.green:sig.signal==='SELL'?C.red:C.yellow}}>{sig.signal}</span></span>
         </div>
