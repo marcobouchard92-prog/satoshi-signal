@@ -14,6 +14,7 @@ const TIMEFRAMES = [
   { id:'1Y', label:'1Y', interval:'3d',  limit:122, desc:'Long-term' },
 ]
 
+// ── Indicators ──────────────────────────────────────────────────────────────
 function calcRSI(prices, period=14) {
   if (prices.length < period+1) return 50
   let ag=0, al=0
@@ -71,6 +72,23 @@ function genSignal(ind, price, sens='balanced') {
 const fmt=(n,d=0)=>Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})
 const fmtK=n=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n))
 
+// ── Notification helper ──────────────────────────────────────────────────────
+function sendNotification(signal, price, conf, tf) {
+  if (Notification.permission !== 'granted') return
+  const emoji = signal==='BUY' ? '🟢' : signal==='SELL' ? '🔴' : '🟡'
+  const body = `${emoji} ${signal} signal @ $${fmt(price)} — Confidence ${conf}% (${tf})`
+  try {
+    new Notification('₿ Satoshi Signal', {
+      body,
+      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">₿</text></svg>',
+      badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">₿</text></svg>',
+      tag: 'satoshi-signal',
+      renotify: true,
+    })
+  } catch(e) { console.log('Notification error:', e) }
+}
+
+// ── Components ───────────────────────────────────────────────────────────────
 function Sparkline({prices,width=300,height=80,color=C.accent}) {
   if(!prices||prices.length<2) return null
   const mn=Math.min(...prices),mx=Math.max(...prices),rng=mx-mn||1
@@ -129,6 +147,36 @@ function MACDBars({histogram,width=180,height=50}) {
   )
 }
 
+// ── Notification Banner ──────────────────────────────────────────────────────
+function NotifBanner({notifStatus, onRequest}) {
+  if (notifStatus === 'granted') return (
+    <div style={{background:`${C.green}11`,border:`1px solid ${C.green}33`,borderRadius:8,padding:'10px 14px',display:'flex',alignItems:'center',gap:10,fontSize:11}}>
+      <span style={{fontSize:16}}>🔔</span>
+      <span style={{color:C.green}}>Notifications actives — tu recevras une alerte à chaque changement de signal</span>
+    </div>
+  )
+  if (notifStatus === 'denied') return (
+    <div style={{background:`${C.red}11`,border:`1px solid ${C.red}33`,borderRadius:8,padding:'10px 14px',fontSize:11,color:C.red}}>
+      🔕 Notifications bloquées — autorise-les dans les paramètres de ton navigateur
+    </div>
+  )
+  if (notifStatus === 'unsupported') return (
+    <div style={{background:`${C.yellow}11`,border:`1px solid ${C.yellow}33`,borderRadius:8,padding:'10px 14px',fontSize:11,color:C.yellow}}>
+      ⚠️ Notifications non supportées sur ce navigateur
+    </div>
+  )
+  return (
+    <button onClick={onRequest} style={{width:'100%',background:`${C.accent}11`,border:`1px solid ${C.accent}44`,borderRadius:8,padding:'12px 14px',display:'flex',alignItems:'center',gap:10,fontSize:11,cursor:'pointer',fontFamily:'monospace',color:C.accent,textAlign:'left'}}>
+      <span style={{fontSize:18}}>🔔</span>
+      <div>
+        <div style={{fontWeight:700,marginBottom:2}}>Activer les notifications push</div>
+        <div style={{color:C.muted,fontSize:10}}>Reçois une alerte sur ton téléphone à chaque signal BUY / SELL</div>
+      </div>
+    </button>
+  )
+}
+
+// ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [tf, setTf] = useState(TIMEFRAMES[1])
   const [sens, setSens] = useState('balanced')
@@ -140,7 +188,30 @@ export default function App() {
   const [sigHistory, setSigHistory] = useState([])
   const [aiText, setAiText] = useState('')
   const [aiLoad, setAiLoad] = useState(false)
+  const [notifStatus, setNotifStatus] = useState('default')
+  const [alertLog, setAlertLog] = useState([])
   const lastSig = useRef(null)
+
+  // Check notification permission on load
+  useEffect(() => {
+    if (!('Notification' in window)) {
+      setNotifStatus('unsupported')
+    } else {
+      setNotifStatus(Notification.permission)
+    }
+  }, [])
+
+  const requestNotif = useCallback(async () => {
+    if (!('Notification' in window)) { setNotifStatus('unsupported'); return }
+    const perm = await Notification.requestPermission()
+    setNotifStatus(perm)
+    if (perm === 'granted') {
+      new Notification('₿ Satoshi Signal', {
+        body: '🔔 Notifications activées ! Tu recevras des alertes BUY / SELL en temps réel.',
+        tag: 'satoshi-welcome',
+      })
+    }
+  }, [])
 
   const fetchData = useCallback(async () => {
     try {
@@ -186,12 +257,30 @@ export default function App() {
 
   const sig = ind ? genSignal(ind, cur, sens) : {signal:'HOLD',conf:50,buy:0,sell:0,reasons:[]}
 
+  // Signal change detection + notification
   useEffect(() => {
-    if (!ind) return
+    if (!ind || !cur) return
     const {signal,conf}=sig
-    if (signal!=='HOLD' && signal!==lastSig.current) {
-      lastSig.current=signal
-      setSigHistory(h=>[{signal,conf,price:cur,time:new Date().toLocaleTimeString(),tf:tf.label},...h].slice(0,30))
+    if (signal !== lastSig.current) {
+      const prev = lastSig.current
+      lastSig.current = signal
+
+      // Record history for non-HOLD signals
+      if (signal !== 'HOLD') {
+        const entry = {signal,conf,price:cur,time:new Date().toLocaleTimeString(),tf:tf.label}
+        setSigHistory(h=>[entry,...h].slice(0,30))
+
+        // Send notification
+        sendNotification(signal, cur, conf, tf.label)
+
+        // Add to alert log
+        if (prev !== null) {
+          const msg = prev
+            ? `Signal changed: ${prev} → ${signal}`
+            : `New signal: ${signal}`
+          setAlertLog(l=>[{msg, signal, price:cur, time:new Date().toLocaleTimeString()},...l].slice(0,10))
+        }
+      }
     }
   }, [sig.signal, cur])
 
@@ -228,6 +317,7 @@ Analysis:`}],
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.8}}
     @keyframes blink{0%,100%{opacity:1}50%{opacity:.1}}
     @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes slideDown{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
     .tab{background:none;border:none;cursor:pointer;padding:10px 16px;border-bottom:2px solid transparent;font-family:inherit;font-size:11px;letter-spacing:2px;text-transform:uppercase;transition:all .2s;color:#3a5a6a}
     .tab:hover{color:#00c8ff}.tab.on{color:#00c8ff;border-bottom-color:#00c8ff}
     .tf{background:none;border:1px solid #0e2030;border-radius:6px;padding:5px 10px;font-family:inherit;font-size:10px;cursor:pointer;transition:all .2s;color:#3a5a6a;text-align:center}
@@ -256,6 +346,10 @@ Analysis:`}],
               </div>
             </div>
             <div style={{display:'flex',alignItems:'center',gap:18}}>
+              {/* Notif bell */}
+              <button onClick={requestNotif} title="Notifications" style={{background:'none',border:'none',cursor:'pointer',fontSize:18,opacity:notifStatus==='granted'?1:0.4}}>
+                {notifStatus==='granted'?'🔔':'🔕'}
+              </button>
               <div style={{textAlign:'right'}}>
                 <div style={{fontSize:22,fontWeight:900,color:C.white,fontFamily:"'Orbitron',monospace"}}>
                   {cur ? `$${fmt(cur)}` : <span style={{fontSize:14,color:C.muted}}>Loading...</span>}
@@ -278,7 +372,7 @@ Analysis:`}],
             ))}
           </div>
           <div style={{display:'flex'}}>
-            {[['dashboard','⬡ Dashboard'],['signals','⚡ Signals'],['settings','⚙ Settings']].map(([id,lbl])=>(
+            {[['dashboard','⬡ Dashboard'],['signals','⚡ Signals'],['alerts','🔔 Alerts'],['settings','⚙ Settings']].map(([id,lbl])=>(
               <button key={id} className={`tab ${tab===id?'on':''}`} onClick={()=>setTab(id)}>{lbl}</button>
             ))}
           </div>
@@ -286,9 +380,10 @@ Analysis:`}],
       </div>
 
       <div style={{maxWidth:1100,margin:'0 auto',padding:'18px 18px 80px'}}>
+
+        {/* ── DASHBOARD ── */}
         {tab==='dashboard' && (
           <div style={{display:'grid',gridTemplateColumns:'300px 1fr',gap:14,animation:'fadeIn .3s ease'}}>
-            {/* Signal */}
             <div className="card" style={{borderColor:`${C.accent}22`,background:'linear-gradient(135deg,#0a1520,#0d1f30)',display:'flex',flexDirection:'column',gap:14}}>
               <div style={{fontSize:9,color:C.muted,letterSpacing:3}}>SIGNAL — {tf.label} / {tf.desc.toUpperCase()}</div>
               <div style={{display:'flex',justifyContent:'center'}}><Badge signal={sig.signal} conf={sig.conf}/></div>
@@ -315,11 +410,11 @@ Analysis:`}],
                   </div>
                 ))}
               </div>
+              <NotifBanner notifStatus={notifStatus} onRequest={requestNotif}/>
               <div style={{fontSize:9,color:C.muted,textAlign:'center'}}>{status}</div>
             </div>
 
             <div style={{display:'flex',flexDirection:'column',gap:14}}>
-              {/* Chart */}
               <div className="card">
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:12}}>
                   <div>
@@ -397,7 +492,6 @@ Analysis:`}],
               )}
             </div>
 
-            {/* AI */}
             <div className="card" style={{gridColumn:'1 / 3',borderColor:`${C.accent}22`}}>
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
                 <div>
@@ -415,6 +509,7 @@ Analysis:`}],
           </div>
         )}
 
+        {/* ── SIGNALS ── */}
         {tab==='signals' && (
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,animation:'fadeIn .3s ease'}}>
             <div className="card" style={{gridColumn:'1 / 3'}}>
@@ -459,6 +554,47 @@ Analysis:`}],
           </div>
         )}
 
+        {/* ── ALERTS ── */}
+        {tab==='alerts' && (
+          <div style={{display:'flex',flexDirection:'column',gap:14,animation:'fadeIn .3s ease'}}>
+            <div className="card" style={{borderColor:`${C.accent}22`}}>
+              <div style={{fontSize:10,color:C.accent,letterSpacing:3,fontWeight:700,marginBottom:14}}>🔔 NOTIFICATIONS PUSH</div>
+              <NotifBanner notifStatus={notifStatus} onRequest={requestNotif}/>
+              <div style={{marginTop:16,fontSize:11,color:C.muted,lineHeight:1.8}}>
+                <p style={{marginBottom:8}}>Les notifications push t'alertent <strong style={{color:C.text}}>même si l'app est fermée</strong> (tant que l'onglet est ouvert en arrière-plan).</p>
+                <p>Tu recevras une alerte à chaque fois que le signal change :</p>
+                <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:6}}>
+                  {[['🟢 BUY','Signal d\'achat détecté',C.green],['🔴 SELL','Signal de vente détecté',C.red],['🟡 HOLD','Retour en zone neutre',C.yellow]].map(([s,d,c])=>(
+                    <div key={s} style={{display:'flex',gap:10,alignItems:'center',padding:'8px 12px',background:`${c}0a`,borderRadius:8,border:`1px solid ${c}22`}}>
+                      <span style={{fontSize:16}}>{s.split(' ')[0]}</span>
+                      <div><div style={{color:c,fontWeight:700,fontSize:11}}>{s.split(' ')[1]}</div><div style={{color:C.muted,fontSize:10}}>{d}</div></div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="card">
+              <div style={{fontSize:9,color:C.muted,letterSpacing:3,marginBottom:14}}>JOURNAL DES ALERTES</div>
+              {!alertLog.length
+                ? <div style={{color:C.muted,fontSize:12,textAlign:'center',padding:'20px 0'}}>Aucune alerte pour l'instant — les changements de signal apparaîtront ici</div>
+                : alertLog.map((a,i)=>(
+                  <div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 0',borderBottom:`1px solid ${C.border}33`,animation:'slideDown .3s ease'}}>
+                    <div style={{display:'flex',gap:10,alignItems:'center'}}>
+                      <span style={{fontSize:16}}>{a.signal==='BUY'?'🟢':a.signal==='SELL'?'🔴':'🟡'}</span>
+                      <div>
+                        <div style={{fontSize:11,color:a.signal==='BUY'?C.green:a.signal==='SELL'?C.red:C.yellow,fontWeight:700}}>{a.msg}</div>
+                        <div style={{fontSize:10,color:C.muted}}>{a.time}</div>
+                      </div>
+                    </div>
+                    <div style={{fontSize:12,color:C.text,fontFamily:'monospace'}}>${fmt(a.price)}</div>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── SETTINGS ── */}
         {tab==='settings' && (
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,animation:'fadeIn .3s ease'}}>
             <div className="card">
@@ -492,6 +628,7 @@ Analysis:`}],
       <div style={{position:'fixed',bottom:0,left:0,right:0,borderTop:`1px solid ${C.border}`,background:`${C.surface}f0`,backdropFilter:'blur(10px)',padding:'7px 18px',display:'flex',justifyContent:'space-between',fontSize:9,color:C.muted}}>
         <span>SATOSHI — Binance BTC/USDT — Advisory only</span>
         <div style={{display:'flex',gap:14}}>
+          <span>{notifStatus==='granted'?'🔔':'🔕'}</span>
           <span>TF: <span style={{color:C.accent}}>{tf.label}</span></span>
           <span>SIGNAL: <span style={{color:sig.signal==='BUY'?C.green:sig.signal==='SELL'?C.red:C.yellow}}>{sig.signal}</span></span>
         </div>
